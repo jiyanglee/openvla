@@ -29,7 +29,6 @@ import draccus
 import torch
 import torch.distributed as dist
 import tqdm
-from accelerate import PartialState
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
@@ -44,6 +43,7 @@ from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+from prismatic.vla.datasets.vamos_dataset import VamosDataset
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
@@ -116,7 +116,19 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # [Validate] Ensure GPU Available & Set Device / Distributed Context
     assert torch.cuda.is_available(), "Fine-tuning assumes at least one GPU is available!"
-    distributed_state = PartialState()
+    
+    # Try to use accelerate PartialState, fallback to simple implementation
+    try:
+        from accelerate import PartialState
+        distributed_state = PartialState()
+    except (ImportError, Exception):
+        # Fallback if accelerate is not available or has issues
+        class PartialState:
+            def __init__(self):
+                self.is_main_process = True
+                self.local_process_index = 0
+        distributed_state = PartialState()
+    
     torch.cuda.set_device(device_id := distributed_state.local_process_index)
     torch.cuda.empty_cache()
 
@@ -189,37 +201,44 @@ def finetune(cfg: FinetuneConfig) -> None:
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
     # Create Action Tokenizer
-    action_tokenizer = ActionTokenizer(processor.tokenizer)
+    # For VAMOS dataset (2D velocities), we need to adjust min/max action values
+    # Based on data analysis: v_x range ~[0.04, 0.51], v_y range ~[-0.01, 0.21]
+    # We'll use a wider range to be safe: [-1, 1] for both dimensions
+    if cfg.dataset_name == "vamos":
+        action_tokenizer = ActionTokenizer(
+            processor.tokenizer, bins=256, min_action=-1, max_action=1
+        )
+    else:
+        action_tokenizer = ActionTokenizer(processor.tokenizer)
 
-    # Load Fine-tuning Dataset =>> note that we use an RLDS-formatted dataset following Open X-Embodiment by default.
-    #   =>> If you want to use a non-RLDS dataset (e.g., a standard PyTorch Dataset) see the following commented block.
-    #   =>> Note that our training code does not loop over epochs because the RLDS loader does this implicitly; if using
-    #       your own Dataset, make sure to add the appropriate logic to the training loop!
-    #
-    # ---
-    # from prismatic.vla.datasets import DummyDataset
-    #
-    # vla_dataset = DummyDataset(
-    #     action_tokenizer,
-    #     processor.tokenizer,
-    #     image_transform=processor.image_processor.apply_transform,
-    #     prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
-    # )
-    # ---
-    batch_transform = RLDSBatchTransform(
-        action_tokenizer,
-        processor.tokenizer,
-        image_transform=processor.image_processor.apply_transform,
-        prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
-    )
-    vla_dataset = RLDSDataset(
-        cfg.data_root_dir,
-        cfg.dataset_name,
-        batch_transform,
-        resize_resolution=tuple(vla.module.config.image_sizes),
-        shuffle_buffer_size=cfg.shuffle_buffer_size,
-        image_aug=cfg.image_aug,
-    )
+    # Load Fine-tuning Dataset
+    if cfg.dataset_name == "vamos":
+        # Use custom VAMOS dataset (parquet format)
+        vla_dataset = VamosDataset(
+            cfg.data_root_dir,
+            action_tokenizer,
+            processor.tokenizer,
+            image_transform=processor.image_processor.apply_transform,
+            prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
+            train=True,
+            predict_stop_token=True,
+        )
+    else:
+        # Use RLDS-formatted dataset (default)
+        batch_transform = RLDSBatchTransform(
+            action_tokenizer,
+            processor.tokenizer,
+            image_transform=processor.image_processor.apply_transform,
+            prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
+        )
+        vla_dataset = RLDSDataset(
+            cfg.data_root_dir,
+            cfg.dataset_name,
+            batch_transform,
+            resize_resolution=tuple(vla.module.config.image_sizes),
+            shuffle_buffer_size=cfg.shuffle_buffer_size,
+            image_aug=cfg.image_aug,
+        )
 
     # [Important] Save Dataset Statistics =>> used to de-normalize actions for inference!
     if distributed_state.is_main_process:
@@ -229,17 +248,29 @@ def finetune(cfg: FinetuneConfig) -> None:
     collator = PaddedCollatorForActionPrediction(
         processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
     )
+    # For VAMOS dataset, use standard PyTorch DataLoader with shuffling
+    # For RLDS dataset, num_workers=0 (TFDS handles parallelism)
+    # For VAMOS dataset, use num_workers=0 to avoid OOM (workers use too much memory)
     dataloader = DataLoader(
         vla_dataset,
         batch_size=cfg.batch_size,
         sampler=None,
         collate_fn=collator,
-        num_workers=0,  # Important =>> Set to 0 if using RLDS; TFDS rolls its own parallelism!
+        num_workers=0,  # Use 0 workers to avoid OOM (each worker loads data into memory)
+        shuffle=True if cfg.dataset_name == "vamos" else False,  # Shuffle for VAMOS
+        pin_memory=False,  # Disable pin_memory to save memory
     )
 
     # Initialize Logging =>> W&B
+    wandb_enabled = False
     if distributed_state.is_main_process:
-        wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}")
+        try:
+            wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"ft+{exp_id}")
+            wandb_enabled = True
+        except Exception as e:
+            print(f"Warning: wandb initialization failed: {e}")
+            print("Continuing without wandb logging...")
+            wandb_enabled = False
 
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
     recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
@@ -302,7 +333,8 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Push Metrics to W&B (every 10 gradient steps)
             if distributed_state.is_main_process and gradient_step_idx % 10 == 0:
-                wandb.log(
+                if wandb_enabled:
+                    wandb.log(
                     {
                         "train_loss": smoothened_loss,
                         "action_accuracy": smoothened_action_accuracy,
